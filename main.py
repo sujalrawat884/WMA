@@ -4,6 +4,7 @@ import json
 import logging
 import sys
 import io
+import asyncio
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import pandas as pd
@@ -185,6 +186,177 @@ inbound_collection = db[INBOUND_COLLECTION_NAME]
 opt_out_collection = db[OPTOUT_COLLECTION_NAME]
 
 scheduler = AsyncIOScheduler(timezone=SENDER_TZ)
+
+
+async def _fetch_recent_inbound_messages(waid: str, limit: int = 15):
+    if not waid:
+        return []
+    query = {"$or": [{"WaId": waid}, {"payload.WaId": waid}]}
+    return await (
+        inbound_collection
+        .find(query)
+        .sort([("received_at", -1)])
+        .limit(limit)
+        .to_list(None)
+    )
+
+
+def _extract_inbound_body(doc: dict) -> str:
+    return (
+        (doc.get("body") or "")
+        or (doc.get("payload", {}).get("Body") or "")
+        or (doc.get("payload", {}).get("raw_body") or "")
+    )
+
+
+def _normalize_waid_as_e164(waid: Optional[str]) -> Optional[str]:
+    if not waid:
+        return None
+    candidate = waid.strip()
+    if candidate and candidate[0].isdigit():
+        candidate = f"+{candidate}"
+    try:
+        return _normalize_e164(candidate)
+    except Exception:
+        return None
+
+
+async def _generate_session_reply(conversation_lines: List[str]) -> str:
+    prompt = (
+        "You are a concise WhatsApp concierge for a badminton club. "
+        "Craft ONE short, friendly reply under 320 characters. "
+        "No links, no images, no upsell, no emojis. "
+        "If the member is injured or unwell: acknowledge, wish recovery, and say you'll keep their spot open when they're back. "
+        "If they confirmed booking: thank and acknowledge. "
+        "If they decline: acknowledge and invite them next time. "
+        "If they ask a question: give the clearest possible single answer. "
+        "Conversation is newest first:\n" + "\n".join(conversation_lines)
+    )
+
+    try:
+        model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=apiKey)
+        result = model.invoke(prompt)
+        content = getattr(result, "content", str(result)).strip()
+        return content[:320] if content else "Thanks for the update. Rest well and we'll see you when you're ready."
+    except Exception:
+        return "Thanks for the update. Rest well and we'll see you when you're ready."
+
+
+async def _send_whatsapp_session_message(phone_number: str, body: str) -> str:
+    """Send a session message within the 24h window or simulate if credentials missing."""
+    try:
+        normalized_phone = _normalize_e164(phone_number)
+    except ValueError as exc:
+        return f"Failed to format phone number: {exc}"
+
+    if _is_opted_out(normalized_phone):
+        return f"SKIPPED: {normalized_phone} opted out of WhatsApp reminders."
+
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+        _record_notification(normalized_phone, body, "simulated_session")
+        return f"SIMULATION: Session message '{body}' sent to {normalized_phone}"
+
+    try:
+        client = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
+        to_address = _format_whatsapp_address(normalized_phone)
+        message = client.messages.create(
+            from_=TWILIO_WHATSAPP_NUMBER,
+            to=to_address,
+            body=body,
+        )
+        _record_notification(normalized_phone, body, "session_sent", {"sid": getattr(message, "sid", None)})
+        return f"Session reply sent. SID: {message.sid}"
+    except Exception as exc:
+        _record_notification(normalized_phone, body, "session_error", {"error": str(exc)})
+        return f"Failed to send session message: {exc}"
+
+
+async def _maybe_send_session_reply(waid: Optional[str], anchor_id: Optional[ObjectId]):
+    """Attempt to send a short compliant reply within the 24h window after inbound."""
+    normalized = _normalize_waid_as_e164(waid)
+    if not normalized:
+        return
+
+    doc = await inbound_collection.find_one({"_id": anchor_id}) if anchor_id else None
+    received_at = doc.get("received_at") if doc else None
+    if not isinstance(received_at, datetime):
+        return
+
+    if datetime.now(timezone.utc) - received_at > timedelta(hours=24):
+        return
+
+    history = await _fetch_recent_inbound_messages(waid, limit=12)
+    if not history:
+        return
+
+    conversation_lines = []
+    for msg in history:
+        ts = msg.get("received_at")
+        ts_str = ts.isoformat() if isinstance(ts, datetime) else str(ts)
+        body = _extract_inbound_body(msg)
+        conversation_lines.append(f"{ts_str} | {body}")
+
+    reply = await _generate_session_reply(conversation_lines)
+    send_result = await _send_whatsapp_session_message(normalized, reply)
+    logger.info("🤖 Session reply outcome for %s: %s", normalized, send_result)
+
+
+async def _handle_inbound_postprocess(waid: Optional[str], anchor_id: Optional[ObjectId]):
+    await _analyze_and_store_chat_summary(waid, anchor_id)
+    await _maybe_send_session_reply(waid, anchor_id)
+
+
+async def _analyze_and_store_chat_summary(waid: Optional[str], anchor_id: Optional[ObjectId] = None):
+    """Analyze recent inbound messages for a WaId and persist a concise summary."""
+    if not waid:
+        return
+
+    try:
+        messages = await _fetch_recent_inbound_messages(waid)
+        if not messages:
+            return
+
+        conversation_lines = []
+        for msg in messages:
+            ts = msg.get("received_at")
+            ts_str = ts.isoformat() if isinstance(ts, datetime) else str(ts)
+            body = _extract_inbound_body(msg)
+            conversation_lines.append(f"{ts_str} | {body}")
+
+        prompt = (
+            "You are a WhatsApp concierge summarizing member responses to booking reminders. "
+            "Return a JSON object with keys: "
+            "summary (1-2 sentences), "
+            "response_to_reminder (booked_yes | decline | reschedule | question | other), "
+            "follow_up (short guidance for staff), "
+            "sentiment (positive | neutral | negative), "
+            "latest_message (verbatim latest body). "
+            "Conversation is newest first:\n" + "\n".join(conversation_lines)
+        )
+
+        model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=apiKey)
+        result = model.invoke(prompt)
+        raw_content = getattr(result, "content", str(result))
+
+        try:
+            parsed = json.loads(raw_content)
+        except Exception:
+            parsed = {"summary": raw_content.strip(), "response_to_reminder": "other"}
+
+        payload = {
+            "analysis": parsed,
+            "analysis_raw": raw_content,
+            "analyzed_at": datetime.now(timezone.utc),
+        }
+
+        if anchor_id:
+            await inbound_collection.update_one({"_id": anchor_id}, {"$set": payload})
+        else:
+            await inbound_collection.update_one({"WaId": waid}, {"$set": payload})
+
+        logger.info("📝 Stored chat summary for %s", waid)
+    except Exception as exc:  # pragma: no cover - safety net; summaries are best-effort
+        logger.error("Failed to analyze inbound chat for %s: %s", waid, exc)
 
 
 PyObjectId = DocAnnotated[str, BeforeValidator(str)]
@@ -561,7 +733,9 @@ async def whatsapp_inbound(request: Request):
         "received_at": datetime.now(timezone.utc),
     }
     try:
-        await inbound_collection.insert_one(doc)
+        res = await inbound_collection.insert_one(doc)
+        if waid:
+            asyncio.create_task(_handle_inbound_postprocess(waid, res.inserted_id))
     except Exception as exc:
         logger.error("Failed to persist inbound WhatsApp message: %s", exc)
     return {"status": "received"}
