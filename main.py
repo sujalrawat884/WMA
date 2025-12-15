@@ -9,6 +9,7 @@ from pathlib import Path
 import pandas as pd
 from datetime import date, datetime, time, timezone, timedelta
 from typing import List, Optional, TypedDict, Annotated
+from zoneinfo import ZoneInfo
 from contextlib import asynccontextmanager
 from operator import itemgetter
 
@@ -91,6 +92,8 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
 TWILIO_CONTENT_TEMPLATE_SID = os.getenv("TWILIO_CONTENT_TEMPLATE_SID")
+SENDER_TIMEZONE = os.getenv("SENDER_TIMEZONE", "America/Toronto")
+SENDER_TZ = ZoneInfo(SENDER_TIMEZONE)
 
 E164_RE = re.compile(r"^\+\d{6,15}$")
 
@@ -181,7 +184,7 @@ bookings_collection = db[COLLECTION_NAME]
 inbound_collection = db[INBOUND_COLLECTION_NAME]
 opt_out_collection = db[OPTOUT_COLLECTION_NAME]
 
-scheduler = AsyncIOScheduler()
+scheduler = AsyncIOScheduler(timezone=SENDER_TZ)
 
 
 PyObjectId = DocAnnotated[str, BeforeValidator(str)]
@@ -369,11 +372,12 @@ agent_app = workflow.compile()
 
 
 async def run_daily_streak_check():
-    now_local = datetime.now().astimezone()
-    today_str = now_local.strftime("%Y-%m-%d")
-    day_name = now_local.strftime("%A")
+    now_local = datetime.now(SENDER_TZ)
+    target_date = (now_local + timedelta(days=1)).date()
+    target_str = target_date.strftime("%Y-%m-%d")
+    day_name = target_date.strftime("%A")
     
-    logger.info(f"⏰ STARTING DAILY STREAK CHECK for {today_str} ({day_name})")
+    logger.info(f"⏰ STARTING DAILY STREAK CHECK for next day {target_str} ({day_name})")
 
     # absentees = await find_regular_absentees(date.today())
     # if absentees:
@@ -382,21 +386,21 @@ async def run_daily_streak_check():
     #     logger.info("No absentees found by deterministic check.")
     
     prompt = f"""
-    You are the Badminton Club Manager. Today is {today_str} ({day_name}).
+    You are the Badminton Club Manager. Tomorrow is {target_str} ({day_name}).
     
-    Goal: Identify regular players who missed their session today and remind them.
+    Goal: Identify regular players who usually play on {day_name}s and do NOT yet have a booking for tomorrow, then remind them.
     
         1. Call `get_booking_history` to see recent bookings.
         2. Analyze the data:
             - Identify players who usually play on {day_name}s (e.g. played last 2-3 {day_name}s).
-            - Check if they have a booking for TODAY ({today_str}).
-        3. For every regular player who skipped today, produce ONLY the variables needed by the approved WhatsApp template:
+            - Check if they have a booking for TOMORROW ({target_str}).
+        3. For every regular player who has NOT booked for tomorrow, produce ONLY the variables needed by the approved WhatsApp template:
             - Variable {{1}} = the player's preferred first name.
             - Variable {{2}} = a short session label (weekday last attended date), e.g. "Wednesday (last seen 2025-12-01)".
             - Build a JSON string exactly like this: `{{ "1": "<name>", "2": "<session label>" }}` (double braces here so this f-string renders literal braces).
             - Call `send_whatsapp_reminder` with the player's phone number and that JSON string so Twilio can render the template copy on your behalf. Do NOT include custom text or links outside the template.
     
-    If no one missed a streak, just output "No reminders needed."
+    If no reminders are needed, just output "No reminders needed."
     """
     
     try:
