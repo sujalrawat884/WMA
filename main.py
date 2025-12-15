@@ -2,9 +2,10 @@ import os
 import re
 import json
 import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 import pandas as pd
 from datetime import date, datetime, time, timezone, timedelta
-from hashlib import sha256
 from typing import List, Optional, TypedDict, Annotated
 from contextlib import asynccontextmanager
 from operator import itemgetter
@@ -28,7 +29,34 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from twilio.rest import Client
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
+
+
+def _configure_logging():
+    level_name = os.getenv("APP_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    handlers = [stream_handler]
+
+    log_file = os.getenv("APP_LOG_FILE", "/var/log/badminton-ai/app.log")
+    if log_file:
+        try:
+            log_path = Path(log_file)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            max_bytes = int(os.getenv("APP_LOG_MAX_BYTES", "1048576"))
+            backup_count = int(os.getenv("APP_LOG_BACKUP_COUNT", "5"))
+            file_handler = RotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=backup_count)
+            file_handler.setFormatter(formatter)
+            handlers.append(file_handler)
+        except Exception as exc:  # pragma: no cover - best-effort logging setup
+            stream_handler.stream.write(f"WARNING: Failed to configure file logging at {log_file}: {exc}\n")
+
+    logging.basicConfig(level=level, handlers=handlers, force=True)
+
+
+_configure_logging()
 logger = logging.getLogger("BadmintonApp")
 
 apiKey = os.getenv("GOOGLE_API_KEY") # Google API Key (Auto-filled by environment)
