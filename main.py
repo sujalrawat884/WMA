@@ -2,6 +2,8 @@ import os
 import re
 import json
 import logging
+import sys
+import io
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import pandas as pd
@@ -31,12 +33,30 @@ from twilio.rest import Client
 load_dotenv()
 
 
+def _safe_text_stream(base_stream):
+    """Wrap a text stream with UTF-8 encoding if the current encoding is limited."""
+    if not base_stream:
+        return base_stream
+    encoding = (getattr(base_stream, "encoding", "") or "").lower()
+    if encoding != "utf-8" and hasattr(base_stream, "buffer"):
+        try:
+            return io.TextIOWrapper(
+                base_stream.buffer,
+                encoding="utf-8",
+                errors="replace",
+                line_buffering=True,
+            )
+        except Exception:
+            return base_stream
+    return base_stream
+
+
 def _configure_logging():
     level_name = os.getenv("APP_LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
     formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
 
-    stream_handler = logging.StreamHandler()
+    stream_handler = logging.StreamHandler(_safe_text_stream(sys.stdout))
     stream_handler.setFormatter(formatter)
     handlers = [stream_handler]
 
@@ -47,7 +67,12 @@ def _configure_logging():
             log_path.parent.mkdir(parents=True, exist_ok=True)
             max_bytes = int(os.getenv("APP_LOG_MAX_BYTES", "1048576"))
             backup_count = int(os.getenv("APP_LOG_BACKUP_COUNT", "5"))
-            file_handler = RotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=backup_count)
+            file_handler = RotatingFileHandler(
+                log_file,
+                maxBytes=max_bytes,
+                backupCount=backup_count,
+                encoding="utf-8",
+            )
             file_handler.setFormatter(formatter)
             handlers.append(file_handler)
         except Exception as exc:  # pragma: no cover - best-effort logging setup
@@ -106,6 +131,17 @@ def _epoch_millis(value: Optional[datetime]) -> Optional[int]:
     return int(value.timestamp() * 1000)
 
 
+def _stringify_object_ids(value):
+    """Recursively convert any ObjectId instances to strings for JSON responses."""
+    if isinstance(value, list):
+        return [_stringify_object_ids(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _stringify_object_ids(v) for k, v in value.items()}
+    if isinstance(value, ObjectId):
+        return str(value)
+    return value
+
+
 def _is_opted_out(phone_number: str) -> bool:
     if not phone_number:
         return False
@@ -116,11 +152,28 @@ def _is_opted_out(phone_number: str) -> bool:
         return not doc.get("removed_at")
 
 
+def _record_notification(phone_number: str, message_body: str, status: str, meta: Optional[dict] = None):
+    payload = {
+        "phone_number": phone_number,
+        "message_body": message_body,
+        "status": status,
+        "created_at": datetime.now(timezone.utc),
+    }
+    if meta:
+        payload.update(meta)
+    try:
+        with MongoClient(MONGODB_URL, tz_aware=True, tzinfo=timezone.utc) as client:
+            client[DB_NAME][NOTIFICATION_LOG_COLLECTION_NAME].insert_one(payload)
+    except Exception as exc:
+        logger.warning(f"Failed to record notification log for {phone_number}: {exc}")
+
+
 MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
 DB_NAME = os.getenv("DB_NAME", "royal_badminton_club")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "court_bookings")
 INBOUND_COLLECTION_NAME = os.getenv("INBOUND_COLLECTION_NAME", "whatsapp_inbound")
 OPTOUT_COLLECTION_NAME = os.getenv("OPTOUT_COLLECTION_NAME", "notification_opt_outs")
+NOTIFICATION_LOG_COLLECTION_NAME = os.getenv("NOTIFICATION_LOG_COLLECTION_NAME", "notification_logs")
 
 motor_client = AsyncIOMotorClient(MONGODB_URL, tz_aware=True, tzinfo=timezone.utc)
 db = motor_client[DB_NAME]
@@ -249,10 +302,13 @@ def send_whatsapp_reminder(phone_number: str, message_body: str):
         return f"Failed to format phone number: {exc}"
 
     if _is_opted_out(normalized_phone):
+        _record_notification(normalized_phone, message_body, "skipped_opt_out")
         return f"SKIPPED: {normalized_phone} opted out of WhatsApp reminders."
     
     if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
-        return f"SIMULATION: Message '{message_body}' sent to {normalized_phone}"
+        result = f"SIMULATION: Message '{message_body}' sent to {normalized_phone}"
+        _record_notification(normalized_phone, message_body, "simulated")
+        return result
 
     try:
         account_sid = os.environ["TWILIO_ACCOUNT_SID"]
@@ -266,8 +322,10 @@ def send_whatsapp_reminder(phone_number: str, message_body: str):
               content_sid=TWILIO_CONTENT_TEMPLATE_SID,
               content_variables=json.dumps(variables),
         )
+        _record_notification(normalized_phone, message_body, "sent", {"sid": getattr(message, "sid", None)})
         return f"Message sent successfully. SID: {message.sid}"
     except Exception as e:
+        _record_notification(normalized_phone, message_body, "error", {"error": str(e)})
         return f"Failed to send message: {str(e)}"
 
 tools = [get_booking_history, send_whatsapp_reminder]
@@ -383,6 +441,18 @@ async def _extract_twilio_payload(request: Request):
             payload = await request.json()
         except Exception:
             payload = {}
+    if not payload:
+        try:
+            raw_body = (await request.body()).decode("utf-8", errors="replace")
+            payload = {"raw_body": raw_body}
+            # Best-effort parse for application/x-www-form-urlencoded bodies when python-multipart is missing.
+            from urllib.parse import parse_qs
+
+            parsed = {k: v[0] if isinstance(v, list) and v else v for k, v in parse_qs(raw_body).items()}
+            if parsed:
+                payload.update(parsed)
+        except Exception:
+            payload = payload or {}
     return payload, headers
 
 @app.post("/bookings", status_code=status.HTTP_201_CREATED)
@@ -440,9 +510,22 @@ async def get_bookings():
         .sort([("booking_date", -1), ("date", -1), ("createdAt", -1)])
         .to_list(100)
     )
-    for b in bookings:
-        b["_id"] = str(b["_id"])
-    return bookings
+    summarized = []
+    for doc in bookings:
+        name = (
+            (doc.get("user_name") or "").strip()
+            or " ".join(filter(None, [(doc.get("first_name") or "").strip(), (doc.get("last_name") or "").strip()])).strip()
+            or "Unknown"
+        )
+        booking_dt = _coerce_utc_datetime(doc.get("booking_date") or doc.get("date"))
+        summarized.append({
+            "name": name,
+            "booking_date": booking_dt.isoformat() if booking_dt else None,
+            "court_id": _stringify_object_ids(doc.get("court_id")),
+            "slot_id": _stringify_object_ids(doc.get("slot_id")),
+        })
+
+    return summarized
 
 @app.post("/admin/trigger-check")
 async def manual_trigger():
@@ -458,6 +541,25 @@ async def manual_trigger():
 async def whatsapp_inbound(request: Request):
     payload, headers = await _extract_twilio_payload(request)
     logger.info("📥 Incoming WhatsApp message: headers=%s payload=%s", headers, payload)
+    waid = payload.get("WaId") or payload.get("waid")
+    if not waid:
+        from_field = payload.get("From") or ""
+        if "whatsapp:" in from_field:
+            waid = from_field.split(":", 1)[1]
+    doc = {
+        "payload": payload,
+        "headers": headers,
+        "from": payload.get("From"),
+        "to": payload.get("To"),
+        "body": payload.get("Body") or payload.get("raw_body"),
+        "message_sid": payload.get("MessageSid"),
+        "WaId": waid,
+        "received_at": datetime.now(timezone.utc),
+    }
+    try:
+        await inbound_collection.insert_one(doc)
+    except Exception as exc:
+        logger.error("Failed to persist inbound WhatsApp message: %s", exc)
     return {"status": "received"}
 
 @app.post("/webhook/whatsapp/status", status_code=status.HTTP_200_OK)
@@ -465,6 +567,28 @@ async def whatsapp_status_callback(request: Request):
     payload, headers = await _extract_twilio_payload(request)
     logger.info("📊 WhatsApp delivery status: headers=%s payload=%s", headers, payload)
     return {"status": "acknowledged"}
+
+
+@app.get("/inbound")
+async def list_inbound_messages(waid: Optional[str] = None):
+    """Return inbound WhatsApp messages filtered by WaId, only WaId and body fields."""
+    if not waid:
+        raise HTTPException(status_code=400, detail="Query param 'waid' is required")
+
+    docs = (
+        await inbound_collection
+        .find({"$or": [{"WaId": waid}, {"payload.WaId": waid}]})
+        .sort([("received_at", -1)])
+        .limit(50)
+        .to_list(None)
+    )
+    simplified = []
+    for d in docs:
+        simplified.append({
+            "waid": d.get("WaId") or d.get("payload", {}).get("WaId"),
+            "body": d.get("body") or d.get("payload", {}).get("Body") or d.get("payload", {}).get("raw_body"),
+        })
+    return simplified
 
 @app.get("/")
 async def root():
